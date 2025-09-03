@@ -29,36 +29,78 @@
 #define READ_LEN_FROM_POOL 256
 
 static const char* TAG = "adc_state";
-static TaskHandle_t s_task_handle;
+static TaskHandle_t cb_task_handle;
+static TaskHandle_t processing_task;
+// static portMUX_TYPE 
 static volatile int isr_counter = 0;
-
+static SemaphoreHandle_t sem_done_reading = NULL;
+static adc_continuous_handle_t handle = NULL;
+static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 //Declare Variables for Ring Buffer
-static volatile int ring_buf[RING_BUF_SIZE];
-static volatile int head = 0;
-static volatile int tail = 0;
-static float adc_avg = 0;
+static uint8_t ring_buf[RING_BUF_SIZE];
+static int buf_overflow = 0;
+static float adc_avg;
 
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
 {
     BaseType_t mustYield = pdFALSE;
     //Notify that ADC continuous driver has done enough number of conversions
-    vTaskNotifyGiveFromISR(s_task_handle, &mustYield);
+    vTaskNotifyGiveFromISR(cb_task_handle, &mustYield);
     return (mustYield == pdTRUE);
 }
-void adc_init() {
-    //Continuously sample ADC1
-    esp_err_t ret;
+void add_to_ring_buf(int value){
+    static uint16_t idx = 0;
+    BaseType_t task_woken = pdFALSE;
+    if ((idx < RING_BUF_SIZE) && (buf_overflow == 0 )) {
+        ring_buf[idx] = value;
+        idx++;
+    }
+    else {
+        if (xSemaphoreTakeFromISR(sem_done_reading, &task_woken) == pdFALSE) {
+            buf_overflow = 1;
+        }
+        if (buf_overflow == 0) {
+            //start rewriting buffer
+            idx = 0;
+            ESP_LOGD(TAG, "Start to rewrite circular buffer");
+            vTaskNotifyGiveFromISR(processing_task, &task_woken);
+        }
+        // printf("Buffer is full");
+    }
+}
+void cb_task(void * parameters) {
+    uint8_t buf[30];
     uint32_t ret_num = 0;
+    esp_err_t ret;
+    int voltage;
+     while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ret = adc_continuous_read(handle, buf, READ_LEN_FROM_POOL, &ret_num, 0);
+        if (ret == ESP_OK) {
+            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&buf[i];
+                // uint32_t chan_num = p->type1.channel;
+                uint32_t data = p->type2.data;
+                voltage = data * 3300/4095;
+                add_to_ring_buf(voltage);
+                printf("voltage: %d \n", voltage);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else if (ret == ESP_ERR_TIMEOUT) {
+            //We try to read `EXAMPLE_READ_LEN` until API returns timeout, which means there's no available data
+            break;
+        }
+    }
+}
+void adc_init() {
     uint8_t result[READ_LEN_FROM_POOL] = {0};
     memset(result, 0xcc, READ_LEN_FROM_POOL);
 
-    s_task_handle = xTaskGetCurrentTaskHandle();
-    // static adc_channel_t channel[1] = {ADC_CHANNEL_7};
-    // adc_continuous_handle_t handle = NULL;
-    adc_continuous_handle_t handle = NULL;
+    // s_task_handle = xTaskGetCurrentTaskHandle();
+
     adc_continuous_handle_cfg_t adc_config = {
-    .max_store_buf_size = 8,
+    .max_store_buf_size = 12,
     .conv_frame_size = 4,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
@@ -75,53 +117,14 @@ void adc_init() {
         .bit_width = ADC_BIT_WIDTH,
     };
 
-        // ESP_LOGI(TAG, "adc_pattern[%d].atten is :%"PRIx8, i, adc_pattern[i].atten);
-        // ESP_LOGI(TAG, "adc_pattern[%d].channel is :%"PRIx8, i, adc_pattern[i].channel);
-        // ESP_LOGI(TAG, "adc_pattern[%d].unit is :%"PRIx8, i, adc_pattern[i].unit);
-    
     dig_cfg.adc_pattern = &adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
     adc_continuous_evt_cbs_t cbs = {
         .on_conv_done = s_conv_done_cb,
     };
     ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
-    ESP_ERROR_CHECK(adc_continuous_start(handle));
-    // *out_handle = handle;
-    char unit[] = "ADC_UNIT_1";
-    int count = 0;
-    int voltage = 0;
-
-    while (1) {
-
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        ret = adc_continuous_read(handle, result, READ_LEN_FROM_POOL, &ret_num, 0);
-        if (ret == ESP_OK) {
-            ESP_LOGI("TASK", "ret is %x, ret_num is %"PRIu32" bytes", ret, ret_num);
-            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
-                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
-                uint32_t chan_num = p->type1.channel;
-                uint32_t data = p->type2.data;
-                voltage = data * 3300/4095;
-                count++;
-                /* Check the channel number validation, the data is invalid if the channel num exceed the maximum channel */
-                // if (chan_num < SOC_ADC_CHANNEL_NUM(EXAMPLE_ADC_UNIT)) {
-                ESP_LOGI(TAG, "Unit: %s, Channel: %"PRIu32", Value: %"PRIx32, unit, chan_num, data);
-                printf("Vout is: %d \n", voltage);
-                // } else {
-                //     ESP_LOGW(TAG, "Invalid data [%s_%"PRIu32"_%"PRIx32"]", unit, chan_num, data);
-                // }
-            }
-            printf("Numbers of data collected: %d", count);
-            count = 0;
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        } else if (ret == ESP_ERR_TIMEOUT) {
-            //We try to read `EXAMPLE_READ_LEN` until API returns timeout, which means there's no available data
-            break;
-        }
-    }
-    ESP_ERROR_CHECK(adc_continuous_stop(handle));
-    ESP_ERROR_CHECK(adc_continuous_deinit(handle));
+    // ESP_ERROR_CHECK(adc_continuous_stop(handle));
+    // ESP_ERROR_CHECK(adc_continuous_deinit(handle));
 
 }
 static bool IRAM_ATTR onTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void * user_Ctx) {
@@ -132,32 +135,60 @@ static bool IRAM_ATTR onTimer(gptimer_handle_t timer, const gptimer_alarm_event_
     return true;
 }
 
-static void hw_timer(){
-    gptimer_handle_t gptimer = NULL;
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1 * 1000 * 1000,
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-    // Set the timer's alarm action
-    // Register timer event callback functions, allowing user context to be carried
+static void get_avg(){
+    // gptimer_handle_t gptimer = NULL;
+    // gptimer_config_t timer_config = {
+    //     .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+    //     .direction = GPTIMER_COUNT_UP,
+    //     .resolution_hz = 1 * 1000 * 1000,
+    // };
+    // ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+    // // Set the timer's alarm action
+    // // Register timer event callback functions, allowing user context to be carried
    
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = onTimer, // Call the user callback function when the alarm event occurs
-    };
+    // gptimer_event_callbacks_t cbs = {
+    //     .on_alarm = onTimer, // Call the user callback function when the alarm event occurs
+    // };
 
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+    // ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
 
-    gptimer_alarm_config_t alarm_config = {
-        .reload_count = 0,      // When the alarm event occurs, the timer will automatically reload to 0
-        .alarm_count = 1000000, // Set the actual alarm period, since the resolution is 1us, 1000000 represents 1s
-        .flags.auto_reload_on_alarm = true, // Enable auto-reload function
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+    // gptimer_alarm_config_t alarm_config = {
+    //     .reload_count = 0,      // When the alarm event occurs, the timer will automatically reload to 0
+    //     .alarm_count = 1000000, // Set the actual alarm period, since the resolution is 1us, 1000000 represents 1s
+    //     .flags.auto_reload_on_alarm = true, // Enable auto-reload function
+    // };
+    // ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
    
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-    ESP_ERROR_CHECK(gptimer_start(gptimer));
+    // ESP_ERROR_CHECK(gptimer_enable(gptimer));
+    // ESP_ERROR_CHECK(gptimer_start(gptimer));
+    float avg;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        avg = 0.0;
+        for (int i = 0; i < RING_BUF_SIZE; i++) {
+            avg += (float)ring_buf[i];
+            //vTaskDelay(105 / portTICK_PERIOD_MS); // Uncomment to test overrun flag
+        }
+        avg /= RING_BUF_SIZE;
+        if (buf_overflow == 1) {
+
+        }
+    // Updating the shared float may or may not take multiple isntructions, so
+    // we protect it with a mutex or critical section. The ESP-IDF critical
+    // section is the easiest for this application.
+        portENTER_CRITICAL(&spinlock);
+        adc_avg = avg;
+        portEXIT_CRITICAL(&spinlock);
+
+        // Clearing the overrun flag and giving the "done reading" semaphore must
+    // be done together without being interrupted.
+        portENTER_CRITICAL(&spinlock);
+        buf_overflow = 0;
+        xSemaphoreGive(sem_done_reading);
+        portEXIT_CRITICAL(&spinlock);
+
+    }
 }
 static void echo_task(void * arg){
     QueueHandle_t uart_queue;
@@ -187,7 +218,7 @@ static void echo_task(void * arg){
                     // uart_write_bytes(UART_NUM_0, (const char *) &cmd_buf, idx);
                     // printf("\n");
                     if (strcmp(cmd_buf, avg_command) == 0) {
-                        printf("Average: \n");
+                        printf("Average: %f \n", adc_avg);
                     }
                     bzero(cmd_buf, BUF_SIZE);
                     idx = 0;
@@ -197,21 +228,25 @@ static void echo_task(void * arg){
             }
         }
     }
-
 }
 
 void app_main(void)
 {
     // ESP_ERROR_CHECK(nvs_flash_init());
     
-
     // while (1) {
     //     vTaskDelay(pdMS_TO_TICKS(1000));
     //     ESP_LOGI(TAG, "Main Task Alive");
     // }
     // gpio_task();
     adc_init();
+    ESP_ERROR_CHECK(adc_continuous_start(handle));
+    sem_done_reading = xSemaphoreCreateBinary();
+    xSemaphoreGive(sem_done_reading);
 
+    // adc_init();
+    xTaskCreate(cb_task, "Callback Task", 4096, NULL, 10, &cb_task_handle);
     xTaskCreate(echo_task, "uart_echo_task", CONFIG_EXAMPLE_TASK_STACK_SIZE, NULL, 10, NULL);
+    xTaskCreate(get_avg, "calculate average", CONFIG_EXAMPLE_TASK_STACK_SIZE, NULL, 10, &processing_task);
 
 };
